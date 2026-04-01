@@ -139,6 +139,7 @@ func (c *Client) VerifyOnline() (*VerifyResult, error) {
 	reqBody := map[string]string{
 		"license_code":         c.config.LicenseCode,
 		"hardware_fingerprint": c.config.Fingerprint,
+		"public_key":           c.config.PublicKey,
 	}
 	body, err := json.Marshal(reqBody)
 	if err != nil {
@@ -304,6 +305,7 @@ func (c *Client) Activate() error {
 		"hostname":             c.config.Hostname,
 		"ip_address":           getLocalIP(),
 		"os_info":              c.GetOSInfo(),
+		"public_key":           c.config.PublicKey,
 	}
 	body, err := json.Marshal(reqBody)
 	if err != nil {
@@ -386,6 +388,7 @@ func (c *Client) Deactivate() error {
 	reqBody := map[string]string{
 		"license_code":         c.config.LicenseCode,
 		"hardware_fingerprint": c.config.Fingerprint,
+		"public_key":           c.config.PublicKey,
 	}
 	body, err := json.Marshal(reqBody)
 	if err != nil {
@@ -466,6 +469,7 @@ func (c *Client) sendHeartbeat() error {
 	reqBody := map[string]string{
 		"license_code":         c.config.LicenseCode,
 		"hardware_fingerprint": c.config.Fingerprint,
+		"public_key":           c.config.PublicKey,
 	}
 	body, err := json.Marshal(reqBody)
 	if err != nil {
