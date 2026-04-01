@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"net/http"
 	"os"
 	"runtime"
@@ -83,14 +84,17 @@ type LicensePayload struct {
 
 // Client License SDK 客户端
 type Client struct {
-	config     Config
-	httpClient *http.Client
-	stopCh     chan struct{}
-	watchdogCh chan struct{}
-	mu         sync.Mutex
-	running    bool
-	watchdogOn bool
-	onExpired  func() // 离线过期或时间异常时的回调
+	config          Config
+	httpClient      *http.Client
+	stopCh          chan struct{}
+	watchdogCh      chan struct{}
+	mu              sync.Mutex
+	running         bool
+	watchdogOn      bool
+	onExpired       func()              // 离线过期或时间异常时的回调
+	onDeactivated   func(reason string) // 远程注销或心跳宽限期超时的回调
+	lastHeartbeatOK time.Time           // 最后一次心跳成功时间
+	heartbeatGrace  time.Duration       // 心跳宽限期（超过此时间未成功则触发回调）
 }
 
 // NewClient 创建 License 客户端
@@ -345,13 +349,18 @@ func (c *Client) UpdateConfig(config Config) {
 }
 
 // StartHeartbeat 启动后台心跳
-func (c *Client) StartHeartbeat(interval time.Duration) {
+// gracePeriod: 心跳宽限期，连续失败超过此时间触发 onDeactivated（传 0 则不限制）
+// onDeactivated: 远程注销或宽限期超时时触发的回调，传 nil 则不回调
+func (c *Client) StartHeartbeat(interval, gracePeriod time.Duration, onDeactivated func(reason string)) {
 	c.mu.Lock()
 	if c.running {
 		c.mu.Unlock()
 		return
 	}
 	c.running = true
+	c.onDeactivated = onDeactivated
+	c.lastHeartbeatOK = time.Now()
+	c.heartbeatGrace = gracePeriod
 	c.stopCh = make(chan struct{})
 	c.mu.Unlock()
 
@@ -361,12 +370,33 @@ func (c *Client) StartHeartbeat(interval time.Duration) {
 		for {
 			select {
 			case <-ticker.C:
-				_ = c.sendHeartbeat()
+				if err := c.sendHeartbeat(); err != nil {
+					if IsDeactivatedError(err) && c.onDeactivated != nil {
+						c.onDeactivated(err.Error())
+						return
+					}
+					if c.heartbeatGrace > 0 && time.Since(c.lastHeartbeatOK) > c.heartbeatGrace {
+						if c.onDeactivated != nil {
+							c.onDeactivated("心跳连续失败超过宽限期，授权已失效")
+						}
+						return
+					}
+				} else {
+					c.lastHeartbeatOK = time.Now()
+				}
 			case <-c.stopCh:
 				return
 			}
 		}
 	}()
+}
+
+// IsDeactivatedError 判断错误是否为远程注销
+func IsDeactivatedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "DEACTIVATED:")
 }
 
 // StopHeartbeat 停止心跳
