@@ -13,10 +13,10 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"strings"
 	"net/http"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 )
@@ -47,7 +47,7 @@ type Config struct {
 	Hostname    string // 主机名（为空时自动获取）
 	OSInfo      string // 操作系统信息
 
-	HTTPTimeout time.Duration // HTTP 请求超时，默认 10s
+	HTTPTimeout time.Duration // HTTP 请求超时，默认 60s
 }
 
 // VerifyResult 验证结果
@@ -100,7 +100,7 @@ type Client struct {
 // NewClient 创建 License 客户端
 func NewClient(config Config) *Client {
 	if config.HTTPTimeout == 0 {
-		config.HTTPTimeout = 10 * time.Second
+		config.HTTPTimeout = 60 * time.Second
 	}
 	if config.Fingerprint == "" {
 		config.Fingerprint = CollectFingerprint()
