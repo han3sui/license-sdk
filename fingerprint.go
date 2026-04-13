@@ -3,9 +3,7 @@ package license
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/json"
 	"fmt"
-	"net"
 	"os"
 	"os/exec"
 	"regexp"
@@ -15,141 +13,50 @@ import (
 	"time"
 )
 
-// FingerprintDimensions 各维度的独立 hash，用于模糊匹配。
-// 每个维度单独计算 hash，比对时只要达到阈值数量的维度匹配即可认定为同一台机器。
-type FingerprintDimensions struct {
-	OS      string `json:"os"`
-	MAC     string `json:"mac,omitempty"`
-	Machine string `json:"machine,omitempty"`
-	CPU     string `json:"cpu,omitempty"`
-	Disk    string `json:"disk,omitempty"`
-}
-
-const defaultMatchThreshold = 3
-
-// CollectFingerprint 采集机器指纹（返回 JSON 编码的多维度指纹）
+// CollectFingerprint 采集机器指纹，返回 64 字符的 hex 字符串。
+//
+// 只使用跨重启/Docker 重启后仍然稳定的维度：
+//   - OS + Arch（永远稳定）
+//   - Machine ID（/etc/machine-id 或注册表 MachineGuid，物理机和 VM 上稳定，
+//     Docker 中建议挂载宿主机 /etc/machine-id 为只读卷）
+//   - CPU 型号/ID（同一台物理机上不变）
+//
+// 已排除的不稳定因子：
+//   - MAC 地址：Docker 每次启动随机分配虚拟网卡 MAC
+//   - Hostname：Docker 默认 hostname 是随机容器 ID
+//   - Disk ID：Docker 容器中通常无法采集
 func CollectFingerprint() string {
-	dims := CollectFingerprintDimensions()
-	b, _ := json.Marshal(dims)
-	return string(b)
+	parts := collectFingerprintParts()
+	data := strings.Join(parts, "|")
+	hash := sha256.Sum256([]byte(data))
+	return fmt.Sprintf("%x", hash)
 }
 
-// CollectFingerprintDimensions 采集各维度的独立 hash
-func CollectFingerprintDimensions() FingerprintDimensions {
-	dims := FingerprintDimensions{
-		OS: hashValue("os:" + runtime.GOOS + "|arch:" + runtime.GOARCH),
-	}
+func collectFingerprintParts() []string {
+	var parts []string
 
-	if macs := getMACAddresses(); len(macs) > 0 {
-		dims.MAC = hashValue("mac:" + strings.Join(macs, ","))
-	}
+	parts = append(parts, "os:"+runtime.GOOS, "arch:"+runtime.GOARCH)
+
 	if machineID := getMachineIdentifier(); machineID != "" {
-		dims.Machine = hashValue("machine:" + machineID)
+		parts = append(parts, "machine:"+machineID)
 	}
 	if cpuID := getCPUIdentifier(); cpuID != "" {
-		dims.CPU = hashValue("cpu:" + cpuID)
-	}
-	if diskID := getDiskIdentifier(); diskID != "" {
-		dims.Disk = hashValue("disk:" + diskID)
+		parts = append(parts, "cpu:"+cpuID)
 	}
 
-	return dims
-}
-
-// MatchFingerprint 模糊匹配两个指纹，至少 threshold 个非空维度匹配即返回 true。
-// threshold <= 0 时使用默认阈值 3。
-func MatchFingerprint(stored, current string, threshold int) bool {
-	if threshold <= 0 {
-		threshold = defaultMatchThreshold
-	}
-
-	if stored == current {
-		return true
-	}
-
-	storedDims, errS := parseDimensions(stored)
-	currentDims, errC := parseDimensions(current)
-	if errS != nil || errC != nil {
-		return stored == current
-	}
-
-	matched := 0
-	total := 0
-	for _, pair := range []struct{ a, b string }{
-		{storedDims.OS, currentDims.OS},
-		{storedDims.MAC, currentDims.MAC},
-		{storedDims.Machine, currentDims.Machine},
-		{storedDims.CPU, currentDims.CPU},
-		{storedDims.Disk, currentDims.Disk},
-	} {
-		if pair.a == "" || pair.b == "" {
-			continue
-		}
-		total++
-		if pair.a == pair.b {
-			matched++
+	var normalized []string
+	for _, p := range parts {
+		v := strings.ToLower(strings.TrimSpace(p))
+		v = strings.Join(strings.Fields(v), " ")
+		if v != "" {
+			normalized = append(normalized, v)
 		}
 	}
-
-	if total < threshold {
-		return matched == total && total > 0
+	sort.Strings(normalized)
+	if len(normalized) == 0 {
+		return []string{"fallback:unknown"}
 	}
-	return matched >= threshold
-}
-
-func parseDimensions(s string) (FingerprintDimensions, error) {
-	var dims FingerprintDimensions
-	err := json.Unmarshal([]byte(s), &dims)
-	return dims, err
-}
-
-func hashValue(s string) string {
-	s = strings.ToLower(strings.TrimSpace(s))
-	h := sha256.Sum256([]byte(s))
-	return fmt.Sprintf("%x", h[:16])
-}
-
-// virtualIfacePrefixes 需要排除的虚拟网卡名称前缀
-var virtualIfacePrefixes = []string{
-	"veth", "docker", "br-", "virbr", "vbox", "vmnet",
-	"flannel", "cni", "calico", "tunl", "wg",
-}
-
-func getMACAddresses() []string {
-	interfaces, err := net.Interfaces()
-	if err != nil {
-		return nil
-	}
-
-	var macs []string
-	for _, iface := range interfaces {
-		if iface.Flags&net.FlagLoopback != 0 {
-			continue
-		}
-		if len(iface.HardwareAddr) == 0 {
-			continue
-		}
-		if isVirtualInterface(iface.Name) {
-			continue
-		}
-		mac := iface.HardwareAddr.String()
-		if mac != "" {
-			macs = append(macs, mac)
-		}
-	}
-
-	sort.Strings(macs)
-	return macs
-}
-
-func isVirtualInterface(name string) bool {
-	lower := strings.ToLower(name)
-	for _, prefix := range virtualIfacePrefixes {
-		if strings.HasPrefix(lower, prefix) {
-			return true
-		}
-	}
-	return false
+	return normalized
 }
 
 func getMachineIdentifier() string {
@@ -173,19 +80,6 @@ func getCPUIdentifier() string {
 		return getLinuxCPUIdentifier()
 	case "darwin":
 		return getDarwinCPUIdentifier()
-	default:
-		return ""
-	}
-}
-
-func getDiskIdentifier() string {
-	switch runtime.GOOS {
-	case "windows":
-		return getWindowsDiskIdentifier()
-	case "linux":
-		return getLinuxDiskIdentifier()
-	case "darwin":
-		return getDarwinDiskIdentifier()
 	default:
 		return ""
 	}
@@ -258,50 +152,6 @@ func getDarwinCPUIdentifier() string {
 		values = append(values, "signature="+signature)
 	}
 	return strings.Join(values, "|")
-}
-
-func getWindowsDiskIdentifier() string {
-	out := runCommand(3*time.Second, "wmic", "diskdrive", "get", "SerialNumber")
-	id := firstUsefulLine(out, "serialnumber")
-	if id != "" {
-		return id
-	}
-	return runCommand(4*time.Second, "powershell", "-NoProfile", "-Command", "(Get-CimInstance Win32_DiskDrive | Select-Object -First 1 -ExpandProperty SerialNumber)")
-}
-
-func getLinuxDiskIdentifier() string {
-	out := runCommand(2*time.Second, "lsblk", "-dn", "-o", "SERIAL")
-	if id := firstUsefulLine(out, "serial"); id != "" {
-		return id
-	}
-
-	entries, err := os.ReadDir("/dev/disk/by-id")
-	if err != nil {
-		return ""
-	}
-	var ids []string
-	for _, e := range entries {
-		name := e.Name()
-		if strings.Contains(name, "-part") {
-			continue
-		}
-		if strings.HasPrefix(name, "wwn-") || strings.HasPrefix(name, "nvme-") || strings.HasPrefix(name, "ata-") {
-			ids = append(ids, name)
-		}
-	}
-	sort.Strings(ids)
-	if len(ids) == 0 {
-		return ""
-	}
-	return ids[0]
-}
-
-func getDarwinDiskIdentifier() string {
-	out := runCommand(3*time.Second, "diskutil", "info", "/")
-	if uuid := regexFindFirst(out, `(?mi)Disk / Partition UUID:\s*([^\r\n]+)`); uuid != "" {
-		return uuid
-	}
-	return regexFindFirst(out, `(?mi)Volume UUID:\s*([^\r\n]+)`)
 }
 
 func runCommand(timeout time.Duration, name string, args ...string) string {

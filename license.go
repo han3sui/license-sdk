@@ -246,7 +246,7 @@ func (c *Client) VerifyOffline() (*VerifyResult, error) {
 		}
 	}
 
-	if licFile.License.HardwareFingerprint != "" && !MatchFingerprint(licFile.License.HardwareFingerprint, c.config.Fingerprint, 0) {
+	if licFile.License.HardwareFingerprint != "" && licFile.License.HardwareFingerprint != c.config.Fingerprint {
 		result.Valid = false
 		result.Reason = "机器指纹不匹配"
 		return result, nil
