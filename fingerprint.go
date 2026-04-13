@@ -3,6 +3,7 @@ package license
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -14,59 +15,104 @@ import (
 	"time"
 )
 
-// CollectFingerprint 采集机器指纹
-// 采用多源硬件与系统信息（MAC / 机器ID / CPU / 磁盘）生成稳定指纹。
-// 各字段为 best-effort 采集：某项获取失败时自动降级，不影响整体结果。
-func CollectFingerprint() string {
-	parts := collectFingerprintParts()
-	data := strings.Join(parts, "|")
-	hash := sha256.Sum256([]byte(data))
-	return fmt.Sprintf("%x", hash)
+// FingerprintDimensions 各维度的独立 hash，用于模糊匹配。
+// 每个维度单独计算 hash，比对时只要达到阈值数量的维度匹配即可认定为同一台机器。
+type FingerprintDimensions struct {
+	OS      string `json:"os"`
+	MAC     string `json:"mac,omitempty"`
+	Machine string `json:"machine,omitempty"`
+	CPU     string `json:"cpu,omitempty"`
+	Disk    string `json:"disk,omitempty"`
 }
 
-func collectFingerprintParts() []string {
-	var parts []string
+const defaultMatchThreshold = 3
 
-	parts = append(parts, "os:"+runtime.GOOS, "arch:"+runtime.GOARCH)
+// CollectFingerprint 采集机器指纹（返回 JSON 编码的多维度指纹）
+func CollectFingerprint() string {
+	dims := CollectFingerprintDimensions()
+	b, _ := json.Marshal(dims)
+	return string(b)
+}
+
+// CollectFingerprintDimensions 采集各维度的独立 hash
+func CollectFingerprintDimensions() FingerprintDimensions {
+	dims := FingerprintDimensions{
+		OS: hashValue("os:" + runtime.GOOS + "|arch:" + runtime.GOARCH),
+	}
 
 	if macs := getMACAddresses(); len(macs) > 0 {
-		for _, mac := range macs {
-			parts = append(parts, "mac:"+mac)
-		}
+		dims.MAC = hashValue("mac:" + strings.Join(macs, ","))
 	}
-
-	if hostname, err := os.Hostname(); err == nil && hostname != "" {
-		parts = append(parts, "host:"+hostname)
-	}
-
 	if machineID := getMachineIdentifier(); machineID != "" {
-		parts = append(parts, "machine:"+machineID)
+		dims.Machine = hashValue("machine:" + machineID)
 	}
 	if cpuID := getCPUIdentifier(); cpuID != "" {
-		parts = append(parts, "cpu:"+cpuID)
+		dims.CPU = hashValue("cpu:" + cpuID)
 	}
 	if diskID := getDiskIdentifier(); diskID != "" {
-		parts = append(parts, "disk:"+diskID)
+		dims.Disk = hashValue("disk:" + diskID)
 	}
 
-	dedup := make(map[string]struct{}, len(parts))
-	var normalized []string
-	for _, p := range parts {
-		v := normalizePart(p)
-		if v == "" {
+	return dims
+}
+
+// MatchFingerprint 模糊匹配两个指纹，至少 threshold 个非空维度匹配即返回 true。
+// threshold <= 0 时使用默认阈值 3。
+func MatchFingerprint(stored, current string, threshold int) bool {
+	if threshold <= 0 {
+		threshold = defaultMatchThreshold
+	}
+
+	if stored == current {
+		return true
+	}
+
+	storedDims, errS := parseDimensions(stored)
+	currentDims, errC := parseDimensions(current)
+	if errS != nil || errC != nil {
+		return stored == current
+	}
+
+	matched := 0
+	total := 0
+	for _, pair := range []struct{ a, b string }{
+		{storedDims.OS, currentDims.OS},
+		{storedDims.MAC, currentDims.MAC},
+		{storedDims.Machine, currentDims.Machine},
+		{storedDims.CPU, currentDims.CPU},
+		{storedDims.Disk, currentDims.Disk},
+	} {
+		if pair.a == "" || pair.b == "" {
 			continue
 		}
-		if _, ok := dedup[v]; ok {
-			continue
+		total++
+		if pair.a == pair.b {
+			matched++
 		}
-		dedup[v] = struct{}{}
-		normalized = append(normalized, v)
 	}
-	sort.Strings(normalized)
-	if len(normalized) == 0 {
-		return []string{"fallback:unknown"}
+
+	if total < threshold {
+		return matched == total && total > 0
 	}
-	return normalized
+	return matched >= threshold
+}
+
+func parseDimensions(s string) (FingerprintDimensions, error) {
+	var dims FingerprintDimensions
+	err := json.Unmarshal([]byte(s), &dims)
+	return dims, err
+}
+
+func hashValue(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	h := sha256.Sum256([]byte(s))
+	return fmt.Sprintf("%x", h[:16])
+}
+
+// virtualIfacePrefixes 需要排除的虚拟网卡名称前缀
+var virtualIfacePrefixes = []string{
+	"veth", "docker", "br-", "virbr", "vbox", "vmnet",
+	"flannel", "cni", "calico", "tunl", "wg",
 }
 
 func getMACAddresses() []string {
@@ -83,6 +129,9 @@ func getMACAddresses() []string {
 		if len(iface.HardwareAddr) == 0 {
 			continue
 		}
+		if isVirtualInterface(iface.Name) {
+			continue
+		}
 		mac := iface.HardwareAddr.String()
 		if mac != "" {
 			macs = append(macs, mac)
@@ -91,6 +140,16 @@ func getMACAddresses() []string {
 
 	sort.Strings(macs)
 	return macs
+}
+
+func isVirtualInterface(name string) bool {
+	lower := strings.ToLower(name)
+	for _, prefix := range virtualIfacePrefixes {
+		if strings.HasPrefix(lower, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func getMachineIdentifier() string {
@@ -301,10 +360,4 @@ func extractKVByKey(content string, key string) string {
 		return strings.TrimSpace(parts[1])
 	}
 	return ""
-}
-
-func normalizePart(s string) string {
-	s = strings.ToLower(strings.TrimSpace(s))
-	s = strings.Join(strings.Fields(s), " ")
-	return s
 }
